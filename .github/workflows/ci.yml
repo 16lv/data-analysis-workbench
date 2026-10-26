@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: pip install pytest ruff
+        run: pip install pandas numpy matplotlib pytest ruff
       - name: Run Ruff linter
         run: ruff check .
       - name: Run pytest suite

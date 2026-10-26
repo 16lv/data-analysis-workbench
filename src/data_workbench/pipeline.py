@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+matplotlib.use("Agg")
+
 
 @dataclass(frozen=True)
 class TelemetryRecord:
@@ -33,9 +40,9 @@ class ServiceStatistics:
 
 class AnalyticsWorkbench:
     """
-    Ingests raw CSV or programmatic telemetry records, validates numerical bounds,
-    stores clean rows in an indexed SQLite analytical table, and computes cohort
-    aggregations, Pearson correlations, and Z-score latency anomalies.
+    Loads CSV datasets into pandas/SQLite, cleans missing or out-of-range observations,
+    calculates service-level statistical distributions using NumPy/pandas, detects Z-score
+    outliers, and generates Matplotlib SVG/PNG visualisations.
     """
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
@@ -78,6 +85,7 @@ class AnalyticsWorkbench:
                         not rec.record_id
                         or not rec.service
                         or not rec.region
+                        or math.isnan(rec.latency_ms)
                         or rec.latency_ms < 0.0
                         or not (0.0 <= rec.error_rate_pct <= 100.0)
                         or rec.requests_per_sec < 0
@@ -91,6 +99,12 @@ class AnalyticsWorkbench:
 
         self._conn.commit()
         return {"inserted": inserted, "rejected": rejected}
+
+    def to_dataframe(self) -> pd.DataFrame:
+        return pd.read_sql_query(
+            "SELECT * FROM service_telemetry ORDER BY record_id ASC",
+            self._conn,
+        )
 
     def _insert_record(self, rec: TelemetryRecord) -> None:
         self._conn.execute(
@@ -110,40 +124,27 @@ class AnalyticsWorkbench:
         )
 
     def summarize_by_service(self) -> list[ServiceStatistics]:
-        services = [
-            r["service"]
-            for r in self._conn.execute(
-                "SELECT DISTINCT service FROM service_telemetry ORDER BY service ASC"
-            ).fetchall()
-        ]
+        df = self.to_dataframe()
+        if df.empty:
+            return []
+
         results: list[ServiceStatistics] = []
+        for svc, group in df.groupby("service", sort=True):
+            lat = group["latency_ms"].to_numpy(dtype=float)
+            err = group["error_rate_pct"].to_numpy(dtype=float)
+            rps = int(group["requests_per_sec"].sum())
 
-        for svc in services:
-            rows = self._conn.execute(
-                """
-                SELECT latency_ms, error_rate_pct, requests_per_sec
-                FROM service_telemetry
-                WHERE service = ?
-                ORDER BY latency_ms ASC
-                """,
-                (svc,),
-            ).fetchall()
-
-            latencies = [float(r["latency_ms"]) for r in rows]
-            errors = [float(r["error_rate_pct"]) for r in rows]
-            rps_total = sum(int(r["requests_per_sec"]) for r in rows)
-
-            std_dev = statistics.pstdev(latencies) if len(latencies) > 1 else 0.0
+            std_dev = float(np.std(lat, ddof=0)) if len(lat) > 1 else 0.0
             results.append(
                 ServiceStatistics(
-                    service=svc,
-                    sample_count=len(latencies),
-                    mean_latency_ms=round(statistics.fmean(latencies), 2),
-                    median_latency_ms=round(statistics.median(latencies), 2),
-                    p95_latency_ms=round(_quantile(latencies, 0.95), 2),
+                    service=str(svc),
+                    sample_count=len(lat),
+                    mean_latency_ms=round(float(np.mean(lat)), 2),
+                    median_latency_ms=round(float(np.median(lat)), 2),
+                    p95_latency_ms=round(float(np.percentile(lat, 95)), 2),
                     std_dev_latency_ms=round(std_dev, 2),
-                    mean_error_rate_pct=round(statistics.fmean(errors), 3),
-                    total_requests_per_sec=rps_total,
+                    mean_error_rate_pct=round(float(np.mean(err)), 3),
+                    total_requests_per_sec=rps,
                 )
             )
         return results
@@ -187,28 +188,48 @@ class AnalyticsWorkbench:
                 )
         return anomalies
 
+    def export_latency_chart(self, output_path: Path) -> Path:
+        """Generates a dark-themed Matplotlib bar & p95 comparison chart from the loaded dataset."""
+        summaries = self.summarize_by_service()
+        if not summaries:
+            raise ValueError("Cannot generate chart from empty dataset")
+
+        services = [s.service for s in summaries]
+        medians = [s.median_latency_ms for s in summaries]
+        p95s = [s.p95_latency_ms for s in summaries]
+
+        fig, ax = plt.subplots(figsize=(8, 4.2), dpi=140)
+        fig.patch.set_facecolor("#0d0f12")
+        ax.set_facecolor("#13161b")
+
+        x = np.arange(len(services))
+        width = 0.36
+        ax.bar(x - width / 2, medians, width, label="Median (p50) ms", color="#38bdf8")
+        ax.bar(x + width / 2, p95s, width, label="Tail (p95) ms", color="#f59e0b")
+
+        ax.set_title("Service Response Latency: Median vs 95th Percentile (ms)", color="#e5e7eb", pad=12)
+        ax.set_ylabel("Latency (ms)", color="#9ca3af")
+        ax.set_xticks(x)
+        ax.set_xticklabels(services, color="#e5e7eb")
+        ax.tick_params(axis="y", colors="#9ca3af")
+        for spine in ax.spines.values():
+            spine.set_color("#262b35")
+        ax.legend(facecolor="#13161b", edgecolor="#262b35", labelcolor="#e5e7eb")
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(output_path, facecolor=fig.get_facecolor())
+        plt.close(fig)
+        return output_path
+
 
 def pearson_correlation(xs: list[float], ys: list[float]) -> float:
     """Computes Pearson correlation coefficient r in [-1.0, 1.0]."""
     if len(xs) != len(ys) or len(xs) < 2:
         raise ValueError("Input series must have identical length >= 2")
-    mean_x = statistics.fmean(xs)
-    mean_y = statistics.fmean(ys)
-    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
-    den_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
-    den_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
-    if den_x == 0.0 or den_y == 0.0:
+    arr_x = np.asarray(xs, dtype=float)
+    arr_y = np.asarray(ys, dtype=float)
+    if np.std(arr_x) == 0.0 or np.std(arr_y) == 0.0:
         return 0.0
-    return round(num / (den_x * den_y), 4)
-
-
-def _quantile(sorted_vals: list[float], q: float) -> float:
-    if not sorted_vals:
-        return 0.0
-    idx = q * (len(sorted_vals) - 1)
-    lo = math.floor(idx)
-    hi = math.ceil(idx)
-    if lo == hi:
-        return sorted_vals[lo]
-    weight = idx - lo
-    return sorted_vals[lo] * (1.0 - weight) + sorted_vals[hi] * weight
+    corr = float(np.corrcoef(arr_x, arr_y)[0, 1])
+    return round(corr, 4)
